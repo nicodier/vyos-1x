@@ -16,16 +16,11 @@
 import os
 import re
 import json
-import jmespath
 
 from copy import deepcopy
 from glob import glob
 
-from ipaddress import IPv4Network
 from ipaddress import IPv6Interface
-from netifaces import ifaddresses # pylint: disable = no-name-in-module
-from socket import AF_INET
-from socket import AF_INET6
 from netaddr import EUI
 from netaddr import mac_unix_expanded
 
@@ -87,42 +82,44 @@ class Interface(Control):
         'eternal': '',
     }
 
+    _bulk_address_cache = {}
+
     _command_get = {
         'admin_state': {
-            'shellcmd': 'ip -json link show dev {ifname}',
-            'format': lambda j: 'up' if 'UP' in jmespath.search('[*].flags | [0]', json.loads(j)) else 'down',
+            'source': 'bulk_address',
+            'format_data': lambda d: 'up' if 'UP' in d.get('flags', []) else 'down',
         },
         'alias': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].ifalias | [0]', json.loads(j)) or '',
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('ifalias') or '',
         },
         'ifindex': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].ifindex | [0]', json.loads(j)) or '',
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('ifindex', ''),
         },
         'mac': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].address | [0]', json.loads(j)),
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('address'),
         },
         'min_mtu': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].min_mtu | [0]', json.loads(j)),
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('min_mtu'),
         },
         'max_mtu': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].max_mtu | [0]', json.loads(j)),
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('max_mtu'),
         },
         'mtu': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].mtu | [0]', json.loads(j)),
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('mtu'),
         },
         'oper_state': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].operstate | [0]', json.loads(j)),
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('operstate'),
         },
         'vrf': {
-            'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[?linkinfo.info_slave_kind == `vrf`].master | [0]', json.loads(j)),
+            'source': 'bulk_address',
+            'format_data': lambda d: d.get('master') if d.get('linkinfo', {}).get('info_slave_kind') == 'vrf' else None,
         },
     }
 
@@ -316,6 +313,32 @@ class Interface(Control):
         """
         return deepcopy(cls.default)
 
+    def _bulk_cache_key(self):
+        return self.config.get('netns', '')
+
+    def _get_bulk_address_data(self):
+        cache_key = self._bulk_cache_key()
+        if cache_key not in self._bulk_address_cache:
+            output = self._cmd('ip -json -detail address show')
+            data = json.loads(output)
+            self._bulk_address_cache[cache_key] = {
+                item.get('ifname'): item for item in data if item.get('ifname')
+            }
+        return self._bulk_address_cache[cache_key]
+
+    def get_interface(self, name):
+        command = self._command_get.get(name, {})
+        if command.get('source') == 'bulk_address':
+            data = self._get_bulk_address_data().get(self.ifname, {})
+            return command.get('format_data', lambda value: value)(data)
+        return super().get_interface(name)
+
+    def set_interface(self, name, value):
+        result = super().set_interface(name, value)
+        if name in self._command_set:
+            self._bulk_address_cache.clear()
+        return result
+
     def __init__(self, ifname, **kargs):
         """
         This is the base interface class which supports basic IP/MAC address
@@ -343,7 +366,7 @@ class Interface(Control):
         # we must have updated config before initialising the Interface
         super().__init__(**kargs)
 
-        if not self.exists(ifname):
+        if not self.config.get('skip_exists_check', False) and not self.exists(ifname):
             # Should an Instance of a child class (EthernetIf, DummyIf, ..)
             # be required, then create should be set to False to not accidentally create it.
             # In case a subclass does not define it, we use get to set the default to True
@@ -1204,7 +1227,6 @@ class Interface(Control):
     def get_addr_v4(self):
         """
         Retrieve assigned IPv4 addresses from given interface.
-        This is done using the netifaces and ipaddress python modules.
 
         Example:
         >>> from vyos.ifconfig import Interface
@@ -1212,18 +1234,19 @@ class Interface(Control):
         ['172.16.33.30/24']
         """
         ipv4 = []
-        if AF_INET in ifaddresses(self.config['ifname']):
-            for v4_addr in ifaddresses(self.config['ifname'])[AF_INET]:
-                # we need to manually assemble a list of IPv4 address/prefix
-                prefix = '/' + \
-                    str(IPv4Network('0.0.0.0/' + v4_addr['netmask']).prefixlen)
-                ipv4.append(v4_addr['addr'] + prefix)
+        intf_data = self._get_bulk_address_data().get(self.ifname, {})
+        for addr_info in intf_data.get('addr_info', []):
+            if addr_info.get('family') != 'inet':
+                continue
+            local = addr_info.get('local')
+            prefixlen = addr_info.get('prefixlen')
+            if local is not None and prefixlen is not None:
+                ipv4.append(f'{local}/{prefixlen}')
         return ipv4
 
     def get_addr_v6(self):
         """
         Retrieve assigned IPv6 addresses from given interface.
-        This is done using the netifaces and ipaddress python modules.
 
         Example:
         >>> from vyos.ifconfig import Interface
@@ -1231,17 +1254,14 @@ class Interface(Control):
         ['fe80::20c:29ff:fe11:a174/64']
         """
         ipv6 = []
-        if AF_INET6 in ifaddresses(self.config['ifname']):
-            for v6_addr in ifaddresses(self.config['ifname'])[AF_INET6]:
-                # Note that currently expanded netmasks are not supported. That means
-                # 2001:db00::0/24 is a valid argument while 2001:db00::0/ffff:ff00:: not.
-                # see https://docs.python.org/3/library/ipaddress.html
-                prefix = '/' + v6_addr['netmask'].split('/')[-1]
-
-                # we alsoneed to remove the interface suffix on link local
-                # addresses
-                v6_addr['addr'] = v6_addr['addr'].split('%')[0]
-                ipv6.append(v6_addr['addr'] + prefix)
+        intf_data = self._get_bulk_address_data().get(self.ifname, {})
+        for addr_info in intf_data.get('addr_info', []):
+            if addr_info.get('family') != 'inet6':
+                continue
+            local = addr_info.get('local')
+            prefixlen = addr_info.get('prefixlen')
+            if local is not None and prefixlen is not None:
+                ipv6.append(f'{local}/{prefixlen}')
         return ipv6
 
     def get_addr(self):
