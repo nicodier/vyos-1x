@@ -44,6 +44,11 @@ class Control(Section):
         if kargs.get('debug', True) and debug.enabled('ifconfig'):
             self.debug = 'ifconfig'
 
+        # Cache command output during object lifetime so repeated getters
+        # relying on the same command do not fork/exec again.
+        self._command_cache = {}
+        self._command_json_cache = {}
+
     def _debug_msg (self, message):
         return debug.message(message, self.debug)
 
@@ -70,7 +75,23 @@ class Control(Section):
         Using the defined names, set data write to sysfs.
         """
         cmd = self._command_get[name]['shellcmd'].format(**config)
-        return self._command_get[name].get('format', lambda _: _)(self._cmd(cmd))
+
+        command_get = self._command_get[name]
+
+        output = self._command_cache.get(cmd)
+        if output is None:
+            output = self._cmd(cmd)
+            self._command_cache[cmd] = output
+
+        if command_get.get('json', False):
+            json_output = self._command_json_cache.get(cmd)
+            if json_output is None:
+                import json
+                json_output = json.loads(output)
+                self._command_json_cache[cmd] = json_output
+            return command_get.get('format_json', lambda _: _)(json_output)
+
+        return command_get.get('format', lambda _: _)(output)
 
     def _values(self, name, validate, value):
         """
@@ -121,7 +142,13 @@ class Control(Section):
         config = {**config, **{'value': value}}
 
         cmd = self._command_set[name]['shellcmd'].format(**config)
-        return self._command_set[name].get('format', lambda _: _)(self._cmd(cmd))
+        result = self._command_set[name].get('format', lambda _: _)(self._cmd(cmd))
+
+        # A setter may change values fetched through cached show commands.
+        self._command_cache.clear()
+        self._command_json_cache.clear()
+
+        return result
 
     _sysfs_get = {}
     _sysfs_set = {}

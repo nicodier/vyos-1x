@@ -36,6 +36,26 @@ from vyos.utils.process import rc_cmd
 from vyos.utils.process import call
 from vyos.configquery import op_mode_config_dict
 
+_terminal_columns = None
+
+
+def _get_terminal_columns():
+    global _terminal_columns
+
+    if _terminal_columns is not None:
+        return _terminal_columns
+
+    no_tty = call('tty -s')
+    returned = cmd('stty size') if not no_tty else ''
+    returned = returned.split()
+    if len(returned) == 2:
+        _, _terminal_columns = tuple(int(_) for _ in returned)
+    else:
+        _, _terminal_columns = (40, 80)
+
+    return _terminal_columns
+
+
 # The original implementation of filtered_interfaces has signature:
 # (ifnames: list, iftypes: typing.Union[str, list], vif: bool, vrrp: bool) -> intf: Interface:
 # Arg types allowed in CLI (ifnames: str, iftypes: str) were manually
@@ -66,7 +86,7 @@ def filtered_interfaces(ifnames: typing.Union[str, list],
 
         # As we are only "reading" from the interface - we must use the
         # generic base class which exposes all the data via a common API
-        interface = Interface(ifname, create=False, debug=False)
+        interface = Interface(ifname, create=False, debug=False, skip_exists_check=True)
 
         # VLAN interfaces have a '.' in their name by convention
         if vif and not '.' in ifname:
@@ -98,16 +118,7 @@ def _split_text(text, used=0):
     text: the string to split
     used: number of characted already used in the screen
     """
-    no_tty = call('tty -s')
-
-    returned = cmd('stty size') if not no_tty else ''
-    returned = returned.split()
-    if len(returned) == 2:
-        _, columns = tuple(int(_) for _ in returned)
-    else:
-        _, columns = (40, 80)
-
-    desc_len = columns - used
+    desc_len = _get_terminal_columns() - used
 
     line = ''
     for word in text.split():
